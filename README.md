@@ -66,6 +66,7 @@ This tool allows shard administrators to visually create, edit, and manage spawn
 
 Before running the backend, configure appsettings.json:
 
+```json
 {
   "SpawnEditor": {
     "UoDataPath": "C:\\Program Files (x86)\\Electronic Arts\\Ultima Online Classic",
@@ -73,6 +74,7 @@ Before running the backend, configure appsettings.json:
     "MapFilesPath": "C:\\UOX3\\data\\maps"
   }
 }
+```
 
 Notes:
 - Use double backslashes
