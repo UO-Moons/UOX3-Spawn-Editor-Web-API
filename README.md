@@ -38,7 +38,6 @@ This tool allows shard administrators to visually create, edit, and manage spawn
 - Toggle visibility per file
 - Zoom and pan map smoothly
 - Hide labels when zoomed out
-- Undo / Redo support
 - Faster rendering with filtering
 
 ### Web API
@@ -110,6 +109,23 @@ Changes not saving:
 
 API not connecting:
 - Ensure backend running
+
+---
+
+## Roadmap
+
+The following features and improvements are planned for future updates:
+
+- [ ] Add undo and redo support for region edits
+- [ ] Improve label visibility and zoom-based rendering
+- [ ] Expand filtering options for worlds, maps, and spawn files
+- [ ] Add region grouping for easier navigation in large spawn sets
+- [ ] Add bulk editing tools for common spawn tags
+- [ ] Improve save safety with clearer change tracking
+- [ ] Expand DFN import and export handling
+- [ ] Continue map rendering and performance improvements
+- [ ] Add stronger validation for invalid or incomplete spawn entries
+- [ ] Extend the API for better external tool support
 
 ---
 
