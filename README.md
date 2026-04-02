@@ -36,7 +36,6 @@ This tool allows shard administrators to visually create, edit, and manage spawn
 - Toggle visibility per file
 - Zoom and pan map smoothly
 - Hide labels when zoomed out
-- Undo / Redo support
 - Faster rendering with filtering
 
 ### Web API
