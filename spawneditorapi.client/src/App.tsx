@@ -63,6 +63,12 @@ type ViewState = {
   offsetY: number;
 };
 
+const defaultViewState: ViewState = {
+  zoom: 0.75,
+  offsetX: 40,
+  offsetY: 40
+};
+
 type DragMode = "none" | "pan" | "move-region" | "resize-region";
 type ResizeHandle = "nw" | "ne" | "sw" | "se";
 
@@ -86,6 +92,19 @@ type PickerOption = {
   value: string;
   label: string;
 };
+
+type HistorySnapshot = {
+  regions: SpawnRegion[];
+  selectedRegionId: string | null;
+  activeWorldId: number;
+  activeSourceFilePaths: string[];
+  focusedRegionId: string | null;
+  editedSourceFilePaths: string[];
+  filterSourceFilePath: string;
+  filterRegionId: string;
+};
+
+const maxHistoryEntries = 50;
 
 const fallbackMapWorlds: MapWorldDefinition[] = [
   { id: 0, name: "Felucca", width: 6144, height: 4096, imageUrl: "/api/maps/0.png" },
@@ -343,6 +362,15 @@ function getSpawnEntryType(region: SpawnRegion | null): "NPCLIST" | "NPC" | "ITE
 export default function App() {
   const mapSurfaceRef = useRef<HTMLDivElement | null>(null);
   const hasRestoredStateRef = useRef(false);
+  const undoStackRef = useRef<HistorySnapshot[]>([]);
+  const redoStackRef = useRef<HistorySnapshot[]>([]);
+  const lastAutoCenteredSelectionKeyRef = useRef<string>("");
+  const skipNextAutoCenterRef = useRef(false);
+  const animationFrameRef = useRef<number | null>(null);
+  const animationStartTimeRef = useRef(0);
+  const animationDurationRef = useRef(220);
+  const animationStartViewRef = useRef<ViewState>(defaultViewState);
+  const animationTargetViewRef = useRef<ViewState>(defaultViewState);
 
   const [regions, setRegions] = useState<SpawnRegion[]>([]);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
@@ -351,7 +379,7 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState("");
   const [isBusy, setIsBusy] = useState(false);
   const [activeWorldId, setActiveWorldId] = useState(0);
-  const [viewState, setViewState] = useState<ViewState>({ zoom: 0.75, offsetX: 40, offsetY: 40 });
+  const [viewState, setViewState] = useState<ViewState>(defaultViewState);
   const [dragState, setDragState] = useState<DragState>({
     mode: "none",
     startClientX: 0,
@@ -508,10 +536,15 @@ const filteredRegions = useMemo(() => {
         const insideMapImage = rectIntersectsRect(screenRect, mapImageScreenRect);
 
         const isSelected = region.id === selectedRegionId;
+        const isPanning = dragState.mode === "pan";
         const isLargeEnough =
           screenRect.width >= 6 ||
           screenRect.height >= 6 ||
           (screenRect.width * screenRect.height) >= 36;
+
+        if (isPanning) {
+          return false;
+        }
 
         return insideViewport && insideMapImage && (isSelected || isLargeEnough);
       });
@@ -522,10 +555,11 @@ const filteredRegions = useMemo(() => {
     activeImageSize,
     mapViewportSize,
     mapImageScreenRect,
-    selectedRegionId
+    selectedRegionId,
+    dragState.mode
   ]);
 
-  const shouldShowRegionLabels = showRegionLabels && viewState.zoom >= 0.35;
+  const shouldShowRegionLabels = showRegionLabels && viewState.zoom >= 0.35 && dragState.mode !== "pan";
 
   const mapGridStyle = useMemo(() => {
     const gridSize = Math.max(16, 64 * viewState.zoom);
@@ -534,6 +568,188 @@ const filteredRegions = useMemo(() => {
       backgroundPosition: `${viewState.offsetX}px ${viewState.offsetY}px`
     };
   }, [viewState]);
+
+  function easeInOutCubic(progress: number): number {
+    return progress < 0.5
+      ? 4 * progress * progress * progress
+      : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+  }
+
+  function cancelViewAnimation(): void {
+    if (animationFrameRef.current !== null) {
+      window.cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+  }
+
+  function animateToViewState(targetViewState: ViewState, durationMs = 220): void {
+    cancelViewAnimation();
+
+    animationStartTimeRef.current = performance.now();
+    animationDurationRef.current = durationMs;
+    animationStartViewRef.current = viewState;
+    animationTargetViewRef.current = targetViewState;
+
+    const step = (timestamp: number): void => {
+      const elapsed = timestamp - animationStartTimeRef.current;
+      const progress = Math.max(0, Math.min(1, elapsed / animationDurationRef.current));
+      const easedProgress = easeInOutCubic(progress);
+      const startViewState = animationStartViewRef.current;
+      const target = animationTargetViewRef.current;
+
+      setViewState({
+        zoom: startViewState.zoom + ((target.zoom - startViewState.zoom) * easedProgress),
+        offsetX: startViewState.offsetX + ((target.offsetX - startViewState.offsetX) * easedProgress),
+        offsetY: startViewState.offsetY + ((target.offsetY - startViewState.offsetY) * easedProgress)
+      });
+
+      if (progress < 1) {
+        animationFrameRef.current = window.requestAnimationFrame(step);
+      } else {
+        animationFrameRef.current = null;
+      }
+    };
+
+    animationFrameRef.current = window.requestAnimationFrame(step);
+  }
+
+  function getZoomToFitRegion(region: SpawnRegion, paddingPixels = 100, maxPreferredZoom = 3): number {
+    const targetWorld = getWorldDefinition(mapWorlds, region.world);
+    const targetImageSize = loadedMapImageSizes[targetWorld.id] ?? {
+      width: targetWorld.width,
+      height: targetWorld.height
+    };
+
+    if (mapViewportSize.width <= 0 || mapViewportSize.height <= 0) {
+      return viewState.zoom;
+    }
+
+    const availableWidth = Math.max(100, mapViewportSize.width - (paddingPixels * 2));
+    const availableHeight = Math.max(100, mapViewportSize.height - (paddingPixels * 2));
+    const scaleX = targetImageSize.width / targetWorld.width;
+    const scaleY = targetImageSize.height / targetWorld.height;
+    const regionPixelWidth = Math.max(1, getRegionWidth(region.bounds) * scaleX);
+    const regionPixelHeight = Math.max(1, getRegionHeight(region.bounds) * scaleY);
+    const fitZoomX = availableWidth / regionPixelWidth;
+    const fitZoomY = availableHeight / regionPixelHeight;
+    const fitZoom = Math.min(fitZoomX, fitZoomY);
+
+    return Math.max(0.75, Math.min(5, Math.min(maxPreferredZoom, fitZoom)));
+  }
+
+  function centerViewOnRegion(region: SpawnRegion, requestedZoom?: number, smoothAnimation = true): void {
+    const targetWorld = getWorldDefinition(mapWorlds, region.world);
+    const targetImageSize = loadedMapImageSizes[targetWorld.id] ?? {
+      width: targetWorld.width,
+      height: targetWorld.height
+    };
+
+    if (mapViewportSize.width <= 0 || mapViewportSize.height <= 0) {
+      return;
+    }
+
+    const bounds = normalizeBounds(region.bounds);
+    const regionCenterX = (bounds.x1 + bounds.x2) / 2;
+    const regionCenterY = (bounds.y1 + bounds.y2) / 2;
+
+    const nextZoom = requestedZoom ?? viewState.zoom;
+    const scaleX = targetImageSize.width / targetWorld.width;
+    const scaleY = targetImageSize.height / targetWorld.height;
+
+    const targetViewState: ViewState = {
+      zoom: nextZoom,
+      offsetX: (mapViewportSize.width / 2) - (regionCenterX * scaleX * nextZoom),
+      offsetY: (mapViewportSize.height / 2) - (regionCenterY * scaleY * nextZoom)
+    };
+
+    if (smoothAnimation) {
+      animateToViewState(targetViewState);
+    } else {
+      cancelViewAnimation();
+      setViewState(targetViewState);
+    }
+  }
+
+function centerSelectedRegion(optionalZoom?: number): void {
+  if (!selectedRegion) {
+    return;
+  }
+
+  centerViewOnRegion(selectedRegion, optionalZoom);
+}
+
+  function createHistorySnapshot(): HistorySnapshot {
+    return {
+      regions: regions.map((region) => cloneRegion(region)),
+      selectedRegionId,
+      activeWorldId,
+      activeSourceFilePaths: [...activeSourceFilePaths],
+      focusedRegionId,
+      editedSourceFilePaths: [...editedSourceFilePaths],
+      filterSourceFilePath,
+      filterRegionId
+    };
+  }
+
+  function restoreHistorySnapshot(snapshot: HistorySnapshot): void {
+    setRegions(snapshot.regions.map((region) => cloneRegion(region)));
+    setSelectedRegionId(snapshot.selectedRegionId);
+    setActiveWorldId(snapshot.activeWorldId);
+    setActiveSourceFilePaths([...snapshot.activeSourceFilePaths]);
+    setFocusedRegionId(snapshot.focusedRegionId);
+    setEditedSourceFilePaths([...snapshot.editedSourceFilePaths]);
+    setFilterSourceFilePath(snapshot.filterSourceFilePath);
+    setFilterRegionId(snapshot.filterRegionId);
+  }
+
+  function pushUndoSnapshot(): void {
+    const snapshot = createHistorySnapshot();
+    undoStackRef.current.push(snapshot);
+
+    if (undoStackRef.current.length > maxHistoryEntries) {
+      undoStackRef.current.shift();
+    }
+
+    redoStackRef.current = [];
+  }
+
+  function handleUndo(): void {
+    if (undoStackRef.current.length === 0) {
+      setStatusMessage("Nothing to undo.");
+      return;
+    }
+
+    const currentSnapshot = createHistorySnapshot();
+    const previousSnapshot = undoStackRef.current.pop();
+
+    if (!previousSnapshot) {
+      setStatusMessage("Nothing to undo.");
+      return;
+    }
+
+    redoStackRef.current.push(currentSnapshot);
+    restoreHistorySnapshot(previousSnapshot);
+    setStatusMessage("Undo complete.");
+  }
+
+  function handleRedo(): void {
+    if (redoStackRef.current.length === 0) {
+      setStatusMessage("Nothing to redo.");
+      return;
+    }
+
+    const currentSnapshot = createHistorySnapshot();
+    const nextSnapshot = redoStackRef.current.pop();
+
+    if (!nextSnapshot) {
+      setStatusMessage("Nothing to redo.");
+      return;
+    }
+
+    undoStackRef.current.push(currentSnapshot);
+    restoreHistorySnapshot(nextSnapshot);
+    setStatusMessage("Redo complete.");
+  }
 
   function markSourceFilePathEdited(sourceFilePath: string): void {
     if (!sourceFilePath) {
@@ -553,6 +769,8 @@ const filteredRegions = useMemo(() => {
     if (!selectedRegionId) {
       return;
     }
+
+    pushUndoSnapshot();
 
     setRegions((currentRegions) =>
       currentRegions.map((region) => {
@@ -673,6 +891,8 @@ const filteredRegions = useMemo(() => {
       return;
     }
 
+    pushUndoSnapshot();
+
     const siblingRegions = regions.filter((region) => region.sourceFilePath === targetSourceFilePath);
     const nextRegionNum = siblingRegions.reduce((highestRegionNum, region) => {
       return Math.max(highestRegionNum, region.regionNum);
@@ -762,6 +982,8 @@ const filteredRegions = useMemo(() => {
       return;
     }
 
+    pushUndoSnapshot();
+
     const siblingRegions = regions.filter((region) => region.sourceFilePath === selectedRegion.sourceFilePath);
     const nextRegionNum = siblingRegions.reduce((highestRegionNum, region) => {
       return Math.max(highestRegionNum, region.regionNum);
@@ -815,6 +1037,8 @@ const filteredRegions = useMemo(() => {
     if (deleteIndex < 0) {
       return;
     }
+
+    pushUndoSnapshot();
 
     const deletedRegion = regions[deleteIndex];
     const nextSelectedRegion = regions[deleteIndex + 1] ?? regions[deleteIndex - 1] ?? null;
@@ -883,6 +1107,7 @@ function handleToggleFileFilter(filterId: string): void {
 
       setActiveWorldId(fileRegion.world);
       setSelectedRegionId(fileRegion.id);
+      centerViewOnRegion(fileRegion, getZoomToFitRegion(fileRegion, 120, 2));
     }
 
     setStatusMessage(`Showing only file ${getDisplayFileName(filterSourceFilePath)}.`);
@@ -936,6 +1161,7 @@ function handleToggleFileFilter(filterId: string): void {
     setFocusedRegionId(targetRegion.id);
     setSelectedRegionId(targetRegion.id);
     setActiveWorldId(targetRegion.world);
+    centerViewOnRegion(targetRegion, getZoomToFitRegion(targetRegion, 100, 3));
 
     setStatusMessage(`Showing only region ${targetRegion.regionNum}.`);
   }
@@ -1033,14 +1259,14 @@ function handleToggleFileFilter(filterId: string): void {
       const savedFocusedRegionIdText = localStorage.getItem(storageKeys.focusedRegionId);
       const savedEditedSourceFilePathsText = localStorage.getItem(storageKeys.editedSourceFilePaths);
 
-      let restoredActiveSourceFilePaths = [...nextSourceFiles];
+      let restoredActiveSourceFilePaths: string[] = [];
       let restoredFocusedRegionId: string | null = null;
       let restoredEditedSourceFilePaths: string[] = [];
 
       if (savedActiveSourceFilePathsText) {
         const parsedSourceFilePaths = JSON.parse(savedActiveSourceFilePathsText) as string[];
         const validSourceFilePaths = parsedSourceFilePaths.filter((filePath) => nextSourceFiles.includes(filePath));
-        restoredActiveSourceFilePaths = validSourceFilePaths.length > 0 ? validSourceFilePaths : nextSourceFiles;
+        restoredActiveSourceFilePaths = validSourceFilePaths;
       }
 
       if (savedFocusedRegionIdText) {
@@ -1062,6 +1288,8 @@ function handleToggleFileFilter(filterId: string): void {
       setEditedSourceFilePaths(restoredEditedSourceFilePaths);
       setLoadedWorldIds([]);
       setLoadedSourceFilePaths([]);
+      undoStackRef.current = [];
+      redoStackRef.current = [];
       setFilterSourceFilePath(restoredActiveSourceFilePaths[0] ?? nextSourceFiles[0] ?? "");
       setFilterRegionId("");
       setSelectedRegionId(null);
@@ -1072,9 +1300,20 @@ function handleToggleFileFilter(filterId: string): void {
         ? loadedRegions.find((region) => region.id === restoredFocusedRegionId) ?? null
         : null;
       const selectedRegionFromStorage = localStorage.getItem(storageKeys.selectedRegionId);
-      const nextSelectedRegionId = selectedRegionFromStorage && loadedRegions.some((region) => region.id === selectedRegionFromStorage)
-        ? selectedRegionFromStorage
-        : selectedRegionFromFocusedId?.id ?? loadedRegions[0]?.id ?? null;
+
+	  	const shouldSkipAutoCenter = sessionStorage.getItem("uox3.skipNextAutoCenter") === "true";
+
+	if (shouldSkipAutoCenter) {
+		skipNextAutoCenterRef.current = true;
+		sessionStorage.removeItem("uox3.skipNextAutoCenter");
+      cancelViewAnimation();
+      setViewState(defaultViewState);
+	}
+
+const nextSelectedRegionId =
+  selectedRegionFromStorage && loadedRegions.some((region) => region.id === selectedRegionFromStorage)
+    ? selectedRegionFromStorage
+    : selectedRegionFromFocusedId?.id ?? (shouldSkipAutoCenter ? null : loadedRegions[0]?.id ?? null);
 
       setSelectedRegionId(nextSelectedRegionId);
       setStatusMessage(`Loaded ${loadedRegions.length} region(s) for world ${nextWorldId} from ${nextSourceFiles.length} file(s).`);
@@ -1088,6 +1327,8 @@ function handleToggleFileFilter(filterId: string): void {
       setEditedSourceFilePaths([]);
       setLoadedWorldIds([]);
       setLoadedSourceFilePaths([]);
+      undoStackRef.current = [];
+      redoStackRef.current = [];
       setFilterSourceFilePath("");
       setFilterRegionId("");
       setSelectedRegionId(demoRegions[0]?.id ?? null);
@@ -1151,6 +1392,8 @@ function handleToggleFileFilter(filterId: string): void {
       return;
     }
 
+    cancelViewAnimation();
+
     setDragState({
       mode: "pan",
       startClientX: event.clientX,
@@ -1162,6 +1405,9 @@ function handleToggleFileFilter(filterId: string): void {
 
   function handleRegionMouseDown(event: React.MouseEvent<HTMLDivElement>, region: SpawnRegion): void {
     event.stopPropagation();
+    cancelViewAnimation();
+    pushUndoSnapshot();
+    skipNextAutoCenterRef.current = true;
     setSelectedRegionId(region.id);
 
     setDragState({
@@ -1181,6 +1427,9 @@ function handleToggleFileFilter(filterId: string): void {
   ): void {
     event.stopPropagation();
     event.preventDefault();
+    cancelViewAnimation();
+    pushUndoSnapshot();
+    skipNextAutoCenterRef.current = true;
     setSelectedRegionId(region.id);
 
     setDragState({
@@ -1304,11 +1553,56 @@ function handleToggleFileFilter(filterId: string): void {
       return;
     }
 
+    if (selectedRegionId === null) {
+      return;
+    }
+
     const selectedStillExists = regions.some((region) => region.id === selectedRegionId);
     if (!selectedStillExists) {
-      setSelectedRegionId(regions[0].id);
+      const firstVisibleRegion = visibleRegions[0] ?? null;
+      setSelectedRegionId(firstVisibleRegion ? firstVisibleRegion.id : null);
     }
-  }, [regions, selectedRegionId]);
+  }, [regions, selectedRegionId, visibleRegions]);
+
+  useEffect(() => {
+    if (!selectedRegion || selectedRegion.world !== activeWorldId) {
+      lastAutoCenteredSelectionKeyRef.current = "";
+      return;
+    }
+
+    if (mapViewportSize.width <= 0 || mapViewportSize.height <= 0) {
+      return;
+    }
+
+    const selectionKey = [
+      selectedRegion.id,
+      activeWorldId,
+      activeImageSize.width,
+      activeImageSize.height,
+      mapViewportSize.width,
+      mapViewportSize.height
+    ].join("|");
+
+    if (lastAutoCenteredSelectionKeyRef.current === selectionKey) {
+      return;
+    }
+
+    lastAutoCenteredSelectionKeyRef.current = selectionKey;
+
+    if (skipNextAutoCenterRef.current) {
+      skipNextAutoCenterRef.current = false;
+      return;
+    }
+
+    centerSelectedRegion();
+  }, [
+    selectedRegion,
+    activeWorldId,
+    activeImageSize.width,
+    activeImageSize.height,
+    mapViewportSize.width,
+    mapViewportSize.height
+  ]);
 
   useEffect(() => {
     if (!filterSourceFilePath && availableSourceFiles.length > 0) {
@@ -1370,6 +1664,19 @@ function handleToggleFileFilter(filterId: string): void {
   }, []);
 
   useEffect(() => {
+    if (sessionStorage.getItem("uox3.skipNextAutoCenter") === "true") {
+      skipNextAutoCenterRef.current = true;
+      sessionStorage.removeItem("uox3.skipNextAutoCenter");
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      cancelViewAnimation();
+    };
+  }, []);
+
+  useEffect(() => {
     try {
       const savedActiveWorldIdText = localStorage.getItem(storageKeys.activeWorldId);
       const savedSelectedRegionIdText = localStorage.getItem(storageKeys.selectedRegionId);
@@ -1381,10 +1688,10 @@ function handleToggleFileFilter(filterId: string): void {
 
       let restoredActiveWorldId = 0;
       let restoredSelectedRegionId: string | null = null;
-      let restoredViewState: ViewState = { zoom: 0.75, offsetX: 40, offsetY: 40 };
+      let restoredViewState: ViewState = defaultViewState;
       let restoredSearchText = "";
       let restoredShowRegionLabels = true;
-      let restoredActiveFileFilters = defaultActiveFileFilters;
+      let restoredActiveFileFilters: string[] = [];
       let restoredFocusedRegionId: string | null = null;
 
       if (savedActiveWorldIdText) {
@@ -1399,7 +1706,14 @@ function handleToggleFileFilter(filterId: string): void {
       }
 
       if (savedViewStateText) {
-        restoredViewState = JSON.parse(savedViewStateText) as ViewState;
+        const parsedViewState = JSON.parse(savedViewStateText) as Partial<ViewState>;
+        if (
+          typeof parsedViewState.zoom === "number" &&
+          typeof parsedViewState.offsetX === "number" &&
+          typeof parsedViewState.offsetY === "number"
+        ) {
+          restoredViewState = parsedViewState as ViewState;
+        }
       }
 
       if (savedSearchText) {
@@ -1413,7 +1727,7 @@ function handleToggleFileFilter(filterId: string): void {
       if (savedActiveFileFiltersText) {
         const parsedFilters = JSON.parse(savedActiveFileFiltersText) as string[];
         const validFilters = parsedFilters.filter((filterId) => regionFileFilters.some((entry) => entry.id === filterId));
-        restoredActiveFileFilters = validFilters.length > 0 ? validFilters : [];
+        restoredActiveFileFilters = validFilters;
       }
 
       if (savedFocusedRegionIdText) {
@@ -1516,6 +1830,33 @@ function handleToggleFileFilter(filterId: string): void {
     localStorage.setItem(storageKeys.editedSourceFilePaths, JSON.stringify(editedSourceFilePaths));
   }, [editedSourceFilePaths]);
 
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent): void {
+      const isControlPressed = event.ctrlKey || event.metaKey;
+
+      if (!isControlPressed) {
+        return;
+      }
+
+      if (event.key.toLowerCase() === "z" && !event.shiftKey) {
+        event.preventDefault();
+        handleUndo();
+        return;
+      }
+
+      if (event.key.toLowerCase() === "y" || (event.key.toLowerCase() === "z" && event.shiftKey)) {
+        event.preventDefault();
+        handleRedo();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [regions, selectedRegionId, activeWorldId, activeSourceFilePaths, focusedRegionId, editedSourceFilePaths, filterSourceFilePath, filterRegionId, isBusy]);
+
   function getPickerOptionsForTag(tagName: string): PickerOption[] {
     switch (tagName) {
       case "NPCLIST":
@@ -1553,6 +1894,7 @@ function handleToggleFileFilter(filterId: string): void {
 
   function handleWheel(event: React.WheelEvent<HTMLDivElement>): void {
     event.preventDefault();
+    cancelViewAnimation();
 
     const zoomMultiplier = event.deltaY < 0 ? 1.1 : 1 / 1.1;
 
@@ -1580,6 +1922,14 @@ function handleToggleFileFilter(filterId: string): void {
 
         <div className="toolbar">
 
+          <button onClick={handleUndo} disabled={isBusy || undoStackRef.current.length === 0}>
+            Undo
+          </button>
+
+          <button onClick={handleRedo} disabled={isBusy || redoStackRef.current.length === 0}>
+            Redo
+          </button>
+
           <button onClick={handleReloadFromServer} disabled={isBusy}>
             Reload From Server
           </button>
@@ -1591,6 +1941,13 @@ function handleToggleFileFilter(filterId: string): void {
           <button
             onClick={() => {
               Object.values(storageKeys).forEach((key) => localStorage.removeItem(key));
+              cancelViewAnimation();
+              setSelectedRegionId(null);
+              setFocusedRegionId(null);
+              setActiveFileFilters([]);
+              setActiveSourceFilePaths([]);
+              setViewState(defaultViewState);
+              sessionStorage.setItem("uox3.skipNextAutoCenter", "true");
               window.location.reload();
             }}
             disabled={isBusy}
@@ -1626,13 +1983,31 @@ function handleToggleFileFilter(filterId: string): void {
         </div>
 
         <div className="map-actions">
-          <button type="button" onClick={() => setViewState((current) => ({ ...current, zoom: Math.min(5, current.zoom * 1.2) }))}>
+          <button
+            type="button"
+            onClick={() => {
+              cancelViewAnimation();
+              setViewState((current) => ({ ...current, zoom: Math.min(5, current.zoom * 1.2) }));
+            }}
+          >
             Zoom In
           </button>
-          <button type="button" onClick={() => setViewState((current) => ({ ...current, zoom: Math.max(0.75, current.zoom / 1.2) }))}>
+          <button
+            type="button"
+            onClick={() => {
+              cancelViewAnimation();
+              setViewState((current) => ({ ...current, zoom: Math.max(0.75, current.zoom / 1.2) }));
+            }}
+          >
             Zoom Out
           </button>
-          <button type="button" onClick={() => setViewState({ zoom: 0.75, offsetX: 40, offsetY: 40 })}>
+          <button
+            type="button"
+            onClick={() => {
+              cancelViewAnimation();
+              animateToViewState(defaultViewState, 180);
+            }}
+          >
             Reset View
           </button>
           <button type="button" onClick={() => setShowRegionLabels((current) => !current)}>
@@ -1756,7 +2131,10 @@ function handleToggleFileFilter(filterId: string): void {
               <button
                 key={region.id}
                 className={region.id === selectedRegionId ? "region-item compact selected" : "region-item compact"}
-                onClick={() => setSelectedRegionId(region.id)}
+                onClick={() => {
+                  setSelectedRegionId(region.id);
+                  centerViewOnRegion(region, getZoomToFitRegion(region, 100, 2.5));
+                }}
                 title={`${region.regionNum} ${region.name || region.sectionHeader}\n${region.fileName}\n(${region.bounds.x1}, ${region.bounds.y1}) - (${region.bounds.x2}, ${region.bounds.y2})`}
               >
                 <div className="compact-region-line">
@@ -1771,7 +2149,7 @@ function handleToggleFileFilter(filterId: string): void {
         <main className="panel center-panel map-panel">
           <h2>Map View</h2>
           <div className="map-help-text">
-            Mouse wheel zooms. Drag empty map to pan. Drag a selected region box to move it. Drag the blue corner handles to resize it. Hover a region to see its number and source file.
+            Mouse wheel zooms. Drag empty map to pan. Drag a selected region box to move it. Drag the blue corner handles to resize it. Hover a region to see its number and source file. Region overlays are fully hidden while panning for smoother movement.
           </div>
 
           <div
