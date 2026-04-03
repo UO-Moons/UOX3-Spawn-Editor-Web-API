@@ -116,9 +116,9 @@ API not connecting:
 
 The following features and improvements are planned for future updates:
 
-- [ ] Add undo and redo support for region edits
+- [x] Add undo and redo support for region edits
 - [ ] Improve label visibility and zoom-based rendering
-- [ ] Expand filtering options for worlds, maps, and spawn files
+- [x] Expand filtering options for worlds, maps, and spawn files
 - [ ] Add region grouping for easier navigation in large spawn sets
 - [ ] Add bulk editing tools for common spawn tags
 - [ ] Improve save safety with clearer change tracking
