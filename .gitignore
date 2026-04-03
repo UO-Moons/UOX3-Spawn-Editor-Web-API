@@ -22,3 +22,4 @@ SpawnEditorApi.Server/obj/project.assets.json
 SpawnEditorApi.Server/obj/SpawnEditorApi.Server.csproj.nuget.dgspec.json
 SpawnEditorApi.Server/obj/SpawnEditorApi.Server.csproj.nuget.g.targets
 SpawnEditorApi.Server/obj/SpawnEditorApi.Server.csproj.nuget.g.props
+SpawnEditorApi.Server/appsettings.json
